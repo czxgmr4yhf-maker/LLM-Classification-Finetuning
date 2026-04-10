@@ -1,5 +1,6 @@
 import inspect
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,36 @@ from transformers import (
 
 LABEL_COLUMNS = ["winner_model_a", "winner_model_b", "winner_tie"]
 ID_COLUMN = "id"
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+    def __getattr__(self, name):
+        for stream in self.streams:
+            if hasattr(stream, name):
+                return getattr(stream, name)
+        raise AttributeError(f"{self.__class__.__name__!s} object has no attribute {name!r}")
+
+
+def load_tokenizer(model_name: str):
+    # DeBERTa 不需要 fix_mistral_regex；对非 Mistral 模型传这个参数，
+    # 在部分 transformers / tokenizers 版本组合下会错误进入 Mistral 补丁逻辑。
+    return AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
 
 # 将任意输入规整成安全的普通字符串。
@@ -145,7 +176,9 @@ def build_training_arguments(
     num_epochs: int,
     weight_decay: float,
     force_cpu: bool,
+    use_fp16: bool,
 ):
+    enable_fp16 = bool(use_fp16 and torch.cuda.is_available() and not force_cpu)
     args_kwargs = {
         "output_dir": output_dir,
         "save_strategy": "epoch",
@@ -159,7 +192,7 @@ def build_training_arguments(
         "weight_decay": weight_decay,
         "logging_steps": 50,
         "save_total_limit": 2,
-        "fp16": torch.cuda.is_available() and not force_cpu,
+        "fp16": enable_fp16,
         "report_to": "none",
     }
     training_arg_names = inspect.signature(TrainingArguments.__init__).parameters
@@ -223,8 +256,9 @@ def make_trainer(
     num_epochs: int,
     weight_decay: float,
     force_cpu: bool,
+    use_fp16: bool,
 ):
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    tokenizer = load_tokenizer(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=len(LABEL_COLUMNS),
@@ -241,6 +275,7 @@ def make_trainer(
         num_epochs=num_epochs,
         weight_decay=weight_decay,
         force_cpu=force_cpu,
+        use_fp16=use_fp16,
     )
 
     trainer = build_trainer(
@@ -311,7 +346,7 @@ def average_model_weights(model_dirs: list[str], model_name: str, output_dir: st
 
     averaged_model.load_state_dict(averaged_state)
     averaged_model.save_pretrained(output_path)
-    AutoTokenizer.from_pretrained(model_dirs[0], use_fast=False).save_pretrained(output_path)
+    load_tokenizer(model_dirs[0]).save_pretrained(output_path)
     return str(output_path)
 
 
@@ -336,6 +371,7 @@ def train_kfold(
     seed: int,
     max_train_samples: int | None,
     force_cpu: bool,
+    use_fp16: bool,
 ):
     df = load_dataframe(train_path, is_train=True)
     if max_train_samples:
@@ -373,6 +409,7 @@ def train_kfold(
             num_epochs=num_epochs,
             weight_decay=weight_decay,
             force_cpu=force_cpu,
+            use_fp16=use_fp16,
         )
 
         trainer.train()
@@ -421,7 +458,7 @@ def predict(
         test_df = test_df.head(max_test_samples).copy()
 
     dataset = Dataset.from_pandas(test_df[[ID_COLUMN, "model_input"]], preserve_index=False)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
+    tokenizer = load_tokenizer(model_dir)
     model = AutoModelForSequenceClassification.from_pretrained(model_dir)
     tokenized = tokenize_dataset(dataset, tokenizer, max_length=max_length)
 
@@ -461,7 +498,8 @@ def main():
         "test_path": "test.csv",                    # 测试集路径
         "output_dir": "outputs/deberta_kfold",      # 所有fold模型和平均模型的保存目录
         "submission_path": "submission.csv",        # 最终提交文件路径
-        "model_name": "microsoft/deberta-v3-small", # 预训练模型名称
+        "log_path": "output.txt",                   # 训练和预测的控制台输出同时写入这个文件
+        "model_name": "./local_models/deberta-v3-small", # 预训练模型名称
         "n_splits": 5,                               # K折数量
         "max_length": 512,                           # 最大token长度
         "learning_rate": 2e-5,                       # 学习率
@@ -473,33 +511,49 @@ def main():
         "max_train_samples": None,                   # 只取前面部分训练样本时填写整数，否则填None
         "max_test_samples": None,                    # 只取前面部分测试样本时填写整数，否则填None
         "force_cpu": False,                          # Mac上不稳定时可改成True
+        "use_fp16": False,                           # 服务器环境稳定后再手动改True启用混合精度
     }
 
-    training_result = train_kfold(
-        train_path=config["train_path"],
-        output_dir=config["output_dir"],
-        model_name=config["model_name"],
-        n_splits=config["n_splits"],
-        max_length=config["max_length"],
-        learning_rate=config["learning_rate"],
-        train_batch_size=config["train_batch_size"],
-        eval_batch_size=config["eval_batch_size"],
-        num_epochs=config["num_epochs"],
-        weight_decay=config["weight_decay"],
-        seed=config["seed"],
-        max_train_samples=config["max_train_samples"],
-        force_cpu=config["force_cpu"],
-    )
+    log_path = Path(config["log_path"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_file = log_path.open("w", encoding="utf-8")
+    sys.stdout = TeeStream(original_stdout, log_file)
+    sys.stderr = TeeStream(original_stderr, log_file)
 
-    # 训练完成后，直接用平均模型做测试集预测。
-    predict(
-        test_path=config["test_path"],
-        model_dir=training_result["averaged_model_dir"],
-        submission_path=config["submission_path"],
-        max_length=config["max_length"],
-        eval_batch_size=config["eval_batch_size"],
-        max_test_samples=config["max_test_samples"],
-    )
+    try:
+        print(f"logging to {log_path.resolve()}")
+        training_result = train_kfold(
+            train_path=config["train_path"],
+            output_dir=config["output_dir"],
+            model_name=config["model_name"],
+            n_splits=config["n_splits"],
+            max_length=config["max_length"],
+            learning_rate=config["learning_rate"],
+            train_batch_size=config["train_batch_size"],
+            eval_batch_size=config["eval_batch_size"],
+            num_epochs=config["num_epochs"],
+            weight_decay=config["weight_decay"],
+            seed=config["seed"],
+            max_train_samples=config["max_train_samples"],
+            force_cpu=config["force_cpu"],
+            use_fp16=config["use_fp16"],
+        )
+
+        # 训练完成后，直接用平均模型做测试集预测。
+        predict(
+            test_path=config["test_path"],
+            model_dir=training_result["averaged_model_dir"],
+            submission_path=config["submission_path"],
+            max_length=config["max_length"],
+            eval_batch_size=config["eval_batch_size"],
+            max_test_samples=config["max_test_samples"],
+        )
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
 
 
 if __name__ == "__main__":
